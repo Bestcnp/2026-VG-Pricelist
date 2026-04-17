@@ -24,6 +24,11 @@
   <!-- SheetJS for Excel Import/Export -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
+  <!-- Preconnect to CDNs to speed up downloads -->
+  <link rel="preconnect" href="https://www.gstatic.com">
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="preconnect" href="https://cdn.tailwindcss.com">
+
   <!-- Firebase SDK Imports -->
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-app.js";
@@ -123,6 +128,38 @@
     const getLocalISODate = (date = new Date()) => {
         const offset = date.getTimezoneOffset() * 60000;
         return new Date(date.getTime() - offset).toISOString().split('T')[0];
+    };
+
+    const compressImage = (file, maxWidth = 400, maxHeight = 400) => {
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = (event) => {
+                const img = new Image();
+                img.src = event.target.result;
+                img.onload = () => {
+                    let width = img.width;
+                    let height = img.height;
+
+                    if (width > maxWidth || height > maxHeight) {
+                        if (width > height) {
+                            height = Math.round((height * maxWidth) / width);
+                            width = maxWidth;
+                        } else {
+                            width = Math.round((width * maxHeight) / height);
+                            height = maxHeight;
+                        }
+                    }
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+                    resolve(canvas.toDataURL('image/webp', 0.8)); // Compress nicely to WebP
+                };
+            };
+        });
     };
 
     const deepMergePermissions = (defaultPerms, loadedPerms) => {
@@ -420,14 +457,26 @@
               const dataToSave = { categories, products, masterColors, company, salesperson, salespersonPhone, savedCompanies, savedRoles, savedSalespersons, loginLogs, activityLogs, productCategories, ...overrideData };
               
               if (storageMode === 'cloud' && db && fbUser) {
-                  const docRef = window.fb.doc(db, 'artifacts', appId, 'public', 'data', 'pricelist_db', 'main_state');
-                  await window.fb.setDoc(docRef, dataToSave);
+                  // Break the giant payload into 4 separate documents to bypass the 1MB Firebase limit safely
+                  const colPath = `artifacts/${appId}/public/data/pricelist_app`;
+                  
+                  const configData = { categories: dataToSave.categories, masterColors: dataToSave.masterColors, company: dataToSave.company, salesperson: dataToSave.salesperson, salespersonPhone: dataToSave.salespersonPhone, savedCompanies: dataToSave.savedCompanies, savedRoles: dataToSave.savedRoles, productCategories: dataToSave.productCategories };
+                  const productsData = { products: dataToSave.products };
+                  const usersData = { savedSalespersons: dataToSave.savedSalespersons };
+                  const logsData = { loginLogs: dataToSave.loginLogs, activityLogs: dataToSave.activityLogs };
+
+                  await Promise.all([
+                      window.fb.setDoc(window.fb.doc(db, colPath, 'config'), configData),
+                      window.fb.setDoc(window.fb.doc(db, colPath, 'products'), productsData),
+                      window.fb.setDoc(window.fb.doc(db, colPath, 'users'), usersData),
+                      window.fb.setDoc(window.fb.doc(db, colPath, 'logs'), logsData)
+                  ]);
+              } 
+              
+              if (typeof window !== 'undefined' && window.localforage) {
+                  await window.localforage.setItem('vg_pricelist_data', dataToSave);
               } else {
-                  if (typeof window !== 'undefined' && window.localforage) {
-                      await window.localforage.setItem('vg_pricelist_data', dataToSave);
-                  } else {
-                      localStorage.setItem('vg_pricelist_data', JSON.stringify(dataToSave));
-                  }
+                  localStorage.setItem('vg_pricelist_data', JSON.stringify(dataToSave));
               }
           } catch (err) {
               console.error("Critical error saving to DB", err);
@@ -529,11 +578,16 @@
               }
               if (data) loadDataIntoState(data);
           } catch(e) { console.error("Local Load Error", e); }
+          
+          // 🔥 OPTIMIZATION 1: Immediately turn off the spinner once local data loads!
           setIsInitializing(false);
       };
 
       // 1. Establish App Storage Connection
       useEffect(() => {
+          // 🔥 OPTIMIZATION 2: Trigger local data fetch instantly on app start
+          loadLocalData();
+
           if (auth && db) {
               setStorageMode('cloud');
               const initAuth = async () => {
@@ -543,14 +597,13 @@
                       } else {
                           await window.fb.signInAnonymously(auth);
                       }
-                  } catch(e) { console.error("Firebase Auth Error", e); loadLocalData(); }
+                  } catch(e) { console.error("Firebase Auth Error", e); }
               };
               initAuth();
               const unsubscribe = window.fb.onAuthStateChanged(auth, setFbUser);
               return () => unsubscribe();
           } else {
               setStorageMode('local');
-              loadLocalData();
           }
       }, []);
 
@@ -558,18 +611,19 @@
       useEffect(() => {
           if (storageMode !== 'cloud' || !fbUser || !db) return;
           
-          const docRef = window.fb.doc(db, 'artifacts', appId, 'public', 'data', 'pricelist_db', 'main_state');
+          // Listen to the entire sharded collection instead of a single massive document
+          const colRef = window.fb.collection(db, `artifacts/${appId}/public/data/pricelist_app`);
           
-          const unsubscribe = window.fb.onSnapshot(docRef, (docSnap) => {
-              if (docSnap.exists()) {
-                  loadDataIntoState(docSnap.data());
-              } else {
-                  // Document doesn't exist yet, we rely on local initial state until user hits "Save"
+          const unsubscribe = window.fb.onSnapshot(colRef, (snapshot) => {
+              let combinedData = {};
+              snapshot.forEach(doc => {
+                  Object.assign(combinedData, doc.data());
+              });
+              if (Object.keys(combinedData).length > 0) {
+                  loadDataIntoState(combinedData);
               }
-              setIsInitializing(false);
           }, (error) => {
               console.error("Firestore Sync Error", error);
-              setIsInitializing(false);
           });
 
           return () => unsubscribe();
@@ -784,7 +838,7 @@
           logActivity("System", `Manually saved changes to ${storageMode === 'cloud' ? 'Cloud' : 'Local Storage'}`);
           setTimeout(() => setIsSaving(false), 1500); 
         } catch (error) {
-          alert("Error Saving Data.");
+          alert("Error Saving to Cloud Database.\n\n(Tip: You likely have old products with uncompressed raw images. Delete products with large images and recreate them, the app will auto-compress new ones!)");
           console.error(error);
           setIsSaving(false);
         }
@@ -934,25 +988,37 @@
           }
       };
 
-      const finalizeExcelImport = (type, newItems, resolvedItems, extraUpdates) => {
+      const finalizeExcelImport = async (type, newItems, resolvedItems, extraUpdates) => {
+          let overrides = {};
           if (type === 'products') {
               const merged = [...products.filter(p => !resolvedItems.find(r => r.id === p.id)), ...resolvedItems, ...newItems];
               setProducts(merged);
+              overrides.products = merged;
           } else if (type === 'users') {
               const merged = [...savedSalespersons.filter(u => !resolvedItems.find(r => r.id === u.id)), ...resolvedItems, ...newItems];
               setSavedSalespersons(merged);
+              overrides.savedSalespersons = merged;
           } else if (type === 'categories') {
               const merged = [...productCategories.filter(c => !resolvedItems.find(r => r.id === c.id)), ...resolvedItems, ...newItems];
               setProductCategories(merged);
+              overrides.productCategories = merged;
           }
           
           if (extraUpdates) {
-              if (extraUpdates.categories) setProductCategories(extraUpdates.categories);
+              if (extraUpdates.categories) {
+                  setProductCategories(extraUpdates.categories);
+                  overrides.productCategories = extraUpdates.categories;
+              }
           }
           
           const totalImported = newItems.length + resolvedItems.length;
           logActivity("Import Data", `Imported/Merged ${totalImported} ${type} via Excel`);
-          alert(`Success! Handled ${totalImported} items (Merged: ${resolvedItems.length}, Added: ${newItems.length}). Click "Save!" to sync to cloud.`);
+          
+          if (currentUser?.permissions?.actions?.canSave) {
+              await _forceSaveToDB(overrides);
+          }
+          
+          alert(`Success! Handled ${totalImported} items (Merged: ${resolvedItems.length}, Added: ${newItems.length}). Data auto-synced!`);
       };
 
       const handleExcelImport = (e, type) => {
@@ -1132,97 +1198,140 @@
       // ==========================================
       // DATABASE & FORM HANDLERS
       // ==========================================
-      const handleSaveCompDB = (e) => {
+      const handleSaveCompDB = async (e) => {
         e.preventDefault();
         if (!currentUser.permissions.company.add && !isEditingComp) return alert("Permission denied.");
         if (!currentUser.permissions.company.edit && isEditingComp) return alert("Permission denied.");
         
         let actMsg = '';
+        let newSavedCompanies;
+        let newCompany = company;
+
         if(isEditingComp) {
-            setSavedCompanies(savedCompanies.map(c => c.id === compForm.id ? compForm : c));
-            if(company.id === compForm.id) setCompany(compForm);
+            newSavedCompanies = savedCompanies.map(c => c.id === compForm.id ? compForm : c);
+            if(company.id === compForm.id) newCompany = compForm;
             actMsg = `Edited Company: ${compForm.name}`;
         } else {
-            setSavedCompanies([...savedCompanies, { ...compForm, id: Date.now().toString() }]);
+            newSavedCompanies = [...savedCompanies, { ...compForm, id: Date.now().toString() }];
             actMsg = `Added Company: ${compForm.name}`;
         }
+        
+        setSavedCompanies(newSavedCompanies);
+        if (company.id === compForm.id || !isEditingComp) {
+            setCompany(newCompany);
+        }
+        
         logActivity("Database", actMsg);
+        
+        if (currentUser?.permissions?.actions?.canSave) {
+            await _forceSaveToDB({ savedCompanies: newSavedCompanies, company: newCompany });
+        }
+
         setCompForm({ id: '', name: '', address: '', contact: '', logo: '' });
         setIsEditingComp(false);
       };
       
       const handleEditComp = (c) => { setCompForm(c); setIsEditingComp(true); };
-      const handleDeleteComp = (id) => {
+      
+      const handleDeleteComp = async (id) => {
         if (!currentUser.permissions.company.remove) return alert("Permission denied.");
         const compToDelete = savedCompanies.find(c => c.id === id);
         if(window.confirm("Are you sure you want to delete this company profile?")) {
-            setSavedCompanies(savedCompanies.filter(c => c.id !== id));
-            if(company.id === id) setCompany({ id: '', name: '', address: '', contact: '', logo: '' });
+            const newSavedCompanies = savedCompanies.filter(c => c.id !== id);
+            let newCompany = company;
+            
+            setSavedCompanies(newSavedCompanies);
+            if(company.id === id) {
+                newCompany = { id: '', name: '', address: '', contact: '', logo: '' };
+                setCompany(newCompany);
+            }
             logActivity("Database", `Deleted Company: ${compToDelete?.name}`);
+            
+            if (currentUser?.permissions?.actions?.canSave) {
+                await _forceSaveToDB({ savedCompanies: newSavedCompanies, company: newCompany });
+            }
         }
       };
 
-      const handleDbLogoUpload = (e) => {
+      const handleDbLogoUpload = async (e) => {
         const file = e.target.files[0];
         if (file) {
-          const reader = new FileReader();
-          reader.onloadend = () => setCompForm({ ...compForm, logo: reader.result });
-          reader.readAsDataURL(file);
+          const compressed = await compressImage(file, 300, 300);
+          setCompForm({ ...compForm, logo: compressed });
         }
       };
 
-      const handleSavePcDB = (e) => {
+      const handleSavePcDB = async (e) => {
         e.preventDefault();
         if (!currentUser.permissions.masterData.add && !isEditingPc) return alert("Permission denied.");
         if (!currentUser.permissions.masterData.edit && isEditingPc) return alert("Permission denied.");
         let actMsg = '';
+        let newPc;
         if (isEditingPc) {
-            setProductCategories(productCategories.map(c => c.id === pcForm.id ? pcForm : c));
+            newPc = productCategories.map(c => c.id === pcForm.id ? pcForm : c);
             actMsg = `Edited Product Category: ${pcForm.name}`;
         } else {
-            setProductCategories([...productCategories, { ...pcForm, id: 'pc' + Date.now().toString() }]);
+            newPc = [...productCategories, { ...pcForm, id: 'pc' + Date.now().toString() }];
             actMsg = `Added Product Category: ${pcForm.name}`;
         }
+        setProductCategories(newPc);
         logActivity("Database", actMsg);
+
+        if (currentUser?.permissions?.actions?.canSave) await _forceSaveToDB({ productCategories: newPc });
+
         setPcForm({ id: '', name: '' });
         setIsEditingPc(false);
       };
       
       const handleEditPc = (c) => { setPcForm(c); setIsEditingPc(true); };
-      const handleDeletePc = (id) => {
+      
+      const handleDeletePc = async (id) => {
         if (!currentUser.permissions.masterData.remove) return alert("Permission denied.");
         const catToDelete = productCategories.find(c => c.id === id);
         if (window.confirm("Delete this Product Category? This will remove the category tag from any assigned products.")) {
-            setProductCategories(productCategories.filter(c => c.id !== id));
-            setProducts(products.map(p => p.productCategoryId === id ? { ...p, productCategoryId: '' } : p));
+            const newPc = productCategories.filter(c => c.id !== id);
+            const newProducts = products.map(p => p.productCategoryId === id ? { ...p, productCategoryId: '' } : p);
+            setProductCategories(newPc);
+            setProducts(newProducts);
             logActivity("Database", `Deleted Product Category: ${catToDelete?.name}`);
+            
+            if (currentUser?.permissions?.actions?.canSave) await _forceSaveToDB({ productCategories: newPc, products: newProducts });
         }
       };
 
-      const handleSaveColorDB = (e) => {
+      const handleSaveColorDB = async (e) => {
         e.preventDefault();
         if (!currentUser.permissions.masterData.add && !isEditingColor) return alert("Permission denied.");
         if (!currentUser.permissions.masterData.edit && isEditingColor) return alert("Permission denied.");
         let actMsg = '';
+        let newColors;
         if (isEditingColor) {
-            setMasterColors(masterColors.map(c => c.id === colorForm.id ? colorForm : c));
+            newColors = masterColors.map(c => c.id === colorForm.id ? colorForm : c);
             actMsg = `Edited Product Color: ${colorForm.name}`;
         } else {
-            setMasterColors([...masterColors, { ...colorForm, id: 'color_' + Date.now().toString() }]);
+            newColors = [...masterColors, { ...colorForm, id: 'color_' + Date.now().toString() }];
             actMsg = `Added Product Color: ${colorForm.name}`;
         }
+        setMasterColors(newColors);
         logActivity("Database", actMsg);
+        
+        if (currentUser?.permissions?.actions?.canSave) await _forceSaveToDB({ masterColors: newColors });
+        
         setColorForm({ id: '', name: '' });
         setIsEditingColor(false);
       };
       
       const handleEditColor = (c) => { setColorForm(c); setIsEditingColor(true); };
-      const handleDeleteColor = (id) => {
+      
+      const handleDeleteColor = async (id) => {
         if (!currentUser.permissions.masterData.remove) return alert("Permission denied.");
         const colorToDelete = masterColors.find(c => c.id === id);
         if (window.confirm("Delete this Color? This will permanently remove the color column and its associated prices from all products!")) {
-            setMasterColors(masterColors.filter(c => c.id !== id));
+            const newColors = masterColors.filter(c => c.id !== id);
+            setMasterColors(newColors);
             logActivity("Database", `Deleted Product Color: ${colorToDelete?.name}`);
+            
+            if (currentUser?.permissions?.actions?.canSave) await _forceSaveToDB({ masterColors: newColors });
         }
       };
 
@@ -1241,28 +1350,21 @@
           });
       };
 
-      const handleRoleActionPermissionToggle = (category, action) => {
-           setRoleForm({
-             ...roleForm,
-             permissions: {
-                ...roleForm.permissions,
-                [category]: { ...roleForm.permissions[category], [action]: !roleForm.permissions[category][action] }
-             }
-          });
-      };
-
-      const handleSaveRoleDB = (e) => {
+      const handleSaveRoleDB = async (e) => {
           e.preventDefault();
           if (!currentUser.permissions.users.add && !isEditingRole) return alert("Permission denied.");
           if (!currentUser.permissions.users.edit && isEditingRole) return alert("Permission denied.");
           if (roleForm.id === 'admin' && currentUser.role !== 'admin') return alert("Only Admin can edit the Admin role.");
 
           let updatedRoles;
+          let updatedUsers = savedSalespersons;
+          let newCurrentUser = currentUser;
+
           if (isEditingRole) {
               updatedRoles = savedRoles.map(r => r.id === roleForm.id ? roleForm : r);
               
               // Sync to all users with this role
-              const updatedUsers = savedSalespersons.map(u => {
+              updatedUsers = savedSalespersons.map(u => {
                   if (u.role === roleForm.id) {
                       return { ...u, permissions: JSON.parse(JSON.stringify(roleForm.permissions)) };
                   }
@@ -1271,15 +1373,22 @@
               setSavedSalespersons(updatedUsers);
               
               if (currentUser.role === roleForm.id) {
-                  setCurrentUser({...currentUser, permissions: JSON.parse(JSON.stringify(roleForm.permissions))});
+                  newCurrentUser = {...currentUser, permissions: JSON.parse(JSON.stringify(roleForm.permissions))};
+                  setCurrentUser(newCurrentUser);
               }
           } else {
               updatedRoles = [...savedRoles, { ...roleForm, id: 'role_' + Date.now(), isSystem: false }];
           }
+          
           setSavedRoles(updatedRoles);
+          logActivity("Database", isEditingRole ? `Edited Role: ${roleForm.name}` : `Added Role: ${roleForm.name}`);
+          
+          if (currentUser?.permissions?.actions?.canSave) {
+               await _forceSaveToDB({ savedRoles: updatedRoles, savedSalespersons: updatedUsers });
+          }
+
           setRoleForm({ id: '', name: '', isSystem: false, permissions: JSON.parse(JSON.stringify(basePermissionsTemplate)) });
           setIsEditingRole(false);
-          logActivity("Database", isEditingRole ? `Edited Role: ${roleForm.name}` : `Added Role: ${roleForm.name}`);
       };
 
       const handleEditRole = (r) => { 
@@ -1288,7 +1397,7 @@
           setIsEditingRole(true); 
       };
 
-      const handleDeleteRole = (id) => {
+      const handleDeleteRole = async (id) => {
           if (!currentUser.permissions.users.remove) return alert("Permission denied.");
           if (id === 'admin') return alert("Cannot delete the system Admin role.");
           
@@ -1296,12 +1405,17 @@
           if (isUsed) return alert("Cannot delete this role because it is currently assigned to one or more users. Please change their roles first.");
 
           if (window.confirm("Are you sure you want to delete this Access Role?")) {
-              setSavedRoles(savedRoles.filter(r => r.id !== id));
+              const newRoles = savedRoles.filter(r => r.id !== id);
+              setSavedRoles(newRoles);
               logActivity("Database", `Deleted Role: ${savedRoles.find(r => r.id === id)?.name}`);
+              
+              if (currentUser?.permissions?.actions?.canSave) {
+                   await _forceSaveToDB({ savedRoles: newRoles });
+              }
           }
       };
 
-      const handleSaveSpDB = (e) => {
+      const handleSaveSpDB = async (e) => {
         e.preventDefault();
         if (!currentUser.permissions.users.add && !isEditingSp) return alert("Permission denied.");
         if (!currentUser.permissions.users.edit && isEditingSp) return alert("Permission denied.");
@@ -1310,32 +1424,50 @@
         const userToSave = { ...spForm, permissions: JSON.parse(JSON.stringify(selectedRoleDef.permissions)) };
 
         let actMsg = '';
+        let newUsers;
+        let newSalesperson = salesperson;
+        let newSalespersonPhone = salespersonPhone;
+
         if(isEditingSp) {
-            setSavedSalespersons(savedSalespersons.map(s => s.id === spForm.id ? userToSave : s));
+            newUsers = savedSalespersons.map(s => s.id === spForm.id ? userToSave : s);
             if(salesperson === savedSalespersons.find(s => s.id === spForm.id)?.name) {
-                setSalesperson(spForm.name);
-                setSalespersonPhone(spForm.phone);
+                newSalesperson = spForm.name;
+                newSalespersonPhone = spForm.phone;
+                setSalesperson(newSalesperson);
+                setSalespersonPhone(newSalespersonPhone);
             }
             if (currentUser.id === spForm.id) setCurrentUser({...userToSave});
             actMsg = `Edited User: ${spForm.name}`;
         } else {
-            setSavedSalespersons([...savedSalespersons, { ...userToSave, id: Date.now().toString(), forcePasswordChange: false, sessionToken: null }]);
+            newUsers = [...savedSalespersons, { ...userToSave, id: Date.now().toString(), forcePasswordChange: false, sessionToken: null }];
             actMsg = `Added User: ${spForm.name}`;
         }
+        
+        setSavedSalespersons(newUsers);
         logActivity("Database", actMsg);
+
+        if (currentUser?.permissions?.actions?.canSave) {
+            await _forceSaveToDB({ savedSalespersons: newUsers, salesperson: newSalesperson, salespersonPhone: newSalespersonPhone });
+        }
+        
         setSpForm({ id: '', name: '', phone: '', email: '', password: '', role: 'salesperson', permissions: {} });
         setIsEditingSp(false);
       };
 
       const handleEditSp = (s) => { setSpForm(s); setIsEditingSp(true); };
 
-      const handleDeleteSp = (id) => {
+      const handleDeleteSp = async (id) => {
         if (!currentUser.permissions.users.remove) return alert("Permission denied.");
         if (currentUser.id === id) return alert("You cannot delete your own active account.");
         const usrToDelete = savedSalespersons.find(s => s.id === id);
         if(window.confirm("Are you sure you want to delete this user profile?")) {
-            setSavedSalespersons(savedSalespersons.filter(s => s.id !== id));
+            const newUsers = savedSalespersons.filter(s => s.id !== id);
+            setSavedSalespersons(newUsers);
             logActivity("Database", `Deleted User: ${usrToDelete?.name}`);
+            
+            if (currentUser?.permissions?.actions?.canSave) {
+                await _forceSaveToDB({ savedSalespersons: newUsers });
+            }
         }
       };
 
@@ -1364,13 +1496,19 @@
           setProducts(products.map(p => p.id === productId ? { ...p, categoryId } : p));
       };
 
-      const executeDeleteProduct = () => {
+      const executeDeleteProduct = async () => {
         if (!currentUser.permissions.products.remove) return;
         if (productToDelete) { 
             const pName = products.find(p => p.id === productToDelete)?.name;
-            setProducts(products.filter(p => p.id !== productToDelete)); 
+            const newProducts = products.filter(p => p.id !== productToDelete);
+            
+            setProducts(newProducts); 
             setProductToDelete(null); 
             logActivity("Data", `Deleted Product: ${pName}`);
+            
+            if (currentUser?.permissions?.actions?.canSave) {
+                await _forceSaveToDB({ products: newProducts });
+            }
         }
       };
 
@@ -1394,13 +1532,12 @@
         setProducts(newProducts);
       };
 
-      const handleImageUpload = (e) => {
+      const handleImageUpload = async (e) => {
         if (!currentUser.permissions.products.add && !currentUser.permissions.products.edit) return;
         const file = e.target.files[0];
         if (file) {
-          const reader = new FileReader();
-          reader.onloadend = () => setNewProduct({ ...newProduct, image: reader.result });
-          reader.readAsDataURL(file);
+          const compressed = await compressImage(file, 400, 400);
+          setNewProduct({ ...newProduct, image: compressed });
         }
       };
 
@@ -1416,7 +1553,7 @@
           setIsModalOpen(true);
       };
 
-      const handleAddProductSubmit = (e) => {
+      const handleAddProductSubmit = async (e) => {
         e.preventDefault();
         if (!currentUser.permissions.products.add) return;
         
@@ -1442,9 +1579,15 @@
           prices: parsedPrices
         };
         
-        setProducts([...products, productToAdd]);
+        const newProducts = [...products, productToAdd];
+        
+        setProducts(newProducts);
         setIsModalOpen(false);
         logActivity("Data", `Added Product: ${productToAdd.name}`);
+        
+        if (currentUser?.permissions?.actions?.canSave) {
+             await _forceSaveToDB({ products: newProducts });
+        }
       };
 
       const toggleProductCategory = (id) => {
